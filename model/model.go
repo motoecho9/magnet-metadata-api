@@ -30,3 +30,13 @@ type ErrorResponse struct {
 type MagnetRequest struct {
 	MagnetURI string `json:"magnet_uri"`
 }
+
+// DLQEntry represents a failed torrent request in the dead letter queue
+type DLQEntry struct {
+	InfoHash     string    `json:"info_hash"`
+	MagnetURI    string    `json:"magnet_uri"`
+	FailCount    int       `json:"fail_count"`
+	LastAttempt  time.Time `json:"last_attempt"`
+	FirstFailure time.Time `json:"first_failure"`
+	LastError    string    `json:"last_error"`
+}

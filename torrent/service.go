@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -36,6 +37,10 @@ type TorrentService struct {
 	// Lock mechanism for preventing concurrent requests for same hash
 	hashLocks  map[string]*sync.Mutex
 	lockMapMux sync.RWMutex
+
+	// Dead Letter Queue for failed torrents
+	dlqFile string
+	dlqMux  sync.RWMutex
 }
 
 func NewTorrentService(config *config.Config) (*TorrentService, error) {
@@ -131,7 +136,11 @@ func NewTorrentService(config *config.Config) (*TorrentService, error) {
 		fileCount:   fileCount,
 		hashLocks:   make(map[string]*sync.Mutex),
 		lockMapMux:  sync.RWMutex{},
+		dlqFile:     filepath.Join(config.CacheDir, "dlq.json"),
 	}
+
+	// Start background DLQ processor
+	go service.processDLQ()
 
 	return service, nil
 }
@@ -445,6 +454,8 @@ func (ts *TorrentService) handleGetMetadata(w http.ResponseWriter, r *http.Reque
 		select {
 		case res := <-resultCh:
 			if res.err == nil {
+				// Success! Remove from DLQ if it was there
+				ts.removeTorrentFromDLQ(infoHashStr)
 				w.Header().Set("Content-Type", "application/json")
 				err = json.NewEncoder(w).Encode(res.metadata)
 				if err != nil {
@@ -456,11 +467,15 @@ func (ts *TorrentService) handleGetMetadata(w http.ResponseWriter, r *http.Reque
 			log.Printf("Error retrieving metadata: %v", res.err)
 			lastErr = res.err
 		case <-ctx.Done():
+			// Add to DLQ on timeout
+			ts.addToDLQ(infoHashStr, req.MagnetURI, "Timeout while retrieving metadata")
 			ts.writeError(w, http.StatusGatewayTimeout, "Timeout", "Timeout while retrieving metadata")
 			return
 		}
 	}
 
+	// Both services failed, add to DLQ for later retry
+	ts.addToDLQ(infoHashStr, req.MagnetURI, lastErr.Error())
 	ts.writeError(w, http.StatusInternalServerError, "Failed to get torrent metadata", lastErr.Error())
 }
 
@@ -501,11 +516,16 @@ func (ts *TorrentService) handleHealth(w http.ResponseWriter, r *http.Request) {
 	activeLocks := len(ts.hashLocks)
 	ts.lockMapMux.RUnlock()
 
+	ts.dlqMux.RLock()
+	dlqEntries := ts.loadDLQ()
+	ts.dlqMux.RUnlock()
+
 	health := map[string]interface{}{
 		"status": "ok",
 		"stats": map[string]interface{}{
 			"active_torrents": len(ts.client.Torrents()) + int(ts.fileCount),
 			"active_locks":    activeLocks,
+			"dlq_entries":     len(dlqEntries),
 		},
 	}
 
@@ -513,6 +533,23 @@ func (ts *TorrentService) handleHealth(w http.ResponseWriter, r *http.Request) {
 	err := json.NewEncoder(w).Encode(health)
 	if err != nil {
 		log.Printf("Error encoding health response: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
+func (ts *TorrentService) handleGetDLQ(w http.ResponseWriter, r *http.Request) {
+	ts.dlqMux.RLock()
+	entries := ts.loadDLQ()
+	ts.dlqMux.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	err := json.NewEncoder(w).Encode(map[string]interface{}{
+		"entries": entries,
+		"count":   len(entries),
+	})
+	if err != nil {
+		log.Printf("Error encoding DLQ response: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -539,6 +576,7 @@ func (ts *TorrentService) SetupRoutes() *mux.Router {
 	api := r.PathPrefix("/api/v1").Subrouter()
 	api.HandleFunc("/metadata", ts.handleGetMetadata).Methods("POST")
 	api.HandleFunc("/health", ts.handleHealth).Methods("GET")
+	api.HandleFunc("/dlq", ts.handleGetDLQ).Methods("GET")
 
 	// Download route (if enabled)
 	if ts.config.EnableDownloads {
@@ -567,4 +605,160 @@ func (ts *TorrentService) SetupRoutes() *mux.Router {
 	})
 
 	return r
+}
+
+// addToDLQ adds a failed torrent to the dead letter queue
+func (ts *TorrentService) addToDLQ(infoHash, magnetURI, errorMsg string) {
+	ts.dlqMux.Lock()
+	defer ts.dlqMux.Unlock()
+
+	entries := ts.loadDLQ()
+	now := time.Now()
+
+	// Check if entry already exists
+	for i, entry := range entries {
+		if entry.InfoHash == infoHash {
+			entries[i].FailCount++
+			entries[i].LastAttempt = now
+			entries[i].LastError = errorMsg
+			ts.saveDLQ(entries)
+			log.Printf("Updated DLQ entry for %s, fail count: %d", infoHash, entries[i].FailCount)
+			return
+		}
+	}
+
+	// Add new entry
+	newEntry := model.DLQEntry{
+		InfoHash:     infoHash,
+		MagnetURI:    magnetURI,
+		FailCount:    1,
+		LastAttempt:  now,
+		FirstFailure: now,
+		LastError:    errorMsg,
+	}
+	entries = append(entries, newEntry)
+	ts.saveDLQ(entries)
+	log.Printf("Added new DLQ entry for %s", infoHash)
+}
+
+// loadDLQ loads DLQ entries from disk
+func (ts *TorrentService) loadDLQ() []model.DLQEntry {
+	data, err := os.ReadFile(ts.dlqFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Error reading DLQ file: %v", err)
+		}
+		return []model.DLQEntry{}
+	}
+
+	var entries []model.DLQEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("Error unmarshaling DLQ: %v", err)
+		return []model.DLQEntry{}
+	}
+
+	return entries
+}
+
+// saveDLQ saves DLQ entries to disk
+func (ts *TorrentService) saveDLQ(entries []model.DLQEntry) {
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		log.Printf("Error marshaling DLQ: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(ts.dlqFile, data, 0644); err != nil {
+		log.Printf("Error writing DLQ file: %v", err)
+	}
+}
+
+// removeTorrentFromDLQ removes a torrent from DLQ after successful processing
+func (ts *TorrentService) removeTorrentFromDLQ(infoHash string) {
+	ts.dlqMux.Lock()
+	defer ts.dlqMux.Unlock()
+
+	entries := ts.loadDLQ()
+	for i, entry := range entries {
+		if entry.InfoHash == infoHash {
+			// Remove entry by swapping with last element and truncating
+			entries[i] = entries[len(entries)-1]
+			entries = entries[:len(entries)-1]
+			ts.saveDLQ(entries)
+			log.Printf("Removed %s from DLQ after successful processing", infoHash)
+			return
+		}
+	}
+}
+
+// processDLQ background service to retry failed torrents
+func (ts *TorrentService) processDLQ() {
+	ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+	defer ticker.Stop()
+
+	log.Printf("DLQ processor started")
+
+	for {
+		select {
+		case <-ticker.C:
+			ts.processNextDLQEntry()
+		case <-ts.ctx.Done():
+			log.Printf("DLQ processor stopped")
+			return
+		}
+	}
+}
+
+// processNextDLQEntry processes one entry from the DLQ
+func (ts *TorrentService) processNextDLQEntry() {
+	ts.dlqMux.RLock()
+	entries := ts.loadDLQ()
+	ts.dlqMux.RUnlock()
+
+	if len(entries) == 0 {
+		return
+	}
+
+	// Find entry that's eligible for retry (not attempted recently and hasn't failed too many times)
+	now := time.Now()
+	var selectedEntry *model.DLQEntry
+
+	for i, entry := range entries {
+		// Skip if attempted recently (wait longer based on fail count)
+		backoffMinutes := math.Min(float64(entry.FailCount*30), 240) // Max 4 hours backoff
+		if now.Sub(entry.LastAttempt) < time.Duration(backoffMinutes)*time.Minute {
+			continue
+		}
+
+		// Skip if failed too many times
+		if entry.FailCount >= 10 {
+			continue
+		}
+
+		selectedEntry = &entries[i]
+		break
+	}
+
+	if selectedEntry == nil {
+		return
+	}
+
+	log.Printf("Retrying DLQ entry: %s (attempt %d)", selectedEntry.InfoHash, selectedEntry.FailCount+1)
+
+	// Try to get metadata using fallback only
+	metadata, err := ts.getMetadataFromITorrents(selectedEntry.InfoHash)
+	if err != nil {
+		// Update failure
+		ts.addToDLQ(selectedEntry.InfoHash, selectedEntry.MagnetURI, err.Error())
+		log.Printf("DLQ retry failed for %s: %v", selectedEntry.InfoHash, err)
+		return
+	}
+
+	// Success! Cache the metadata and remove from DLQ
+	if err := ts.cacheMetadata(metadata); err != nil {
+		log.Printf("Failed to cache DLQ success for %s: %v", selectedEntry.InfoHash, err)
+	}
+
+	ts.removeTorrentFromDLQ(selectedEntry.InfoHash)
+	log.Printf("DLQ retry succeeded for %s", selectedEntry.InfoHash)
 }
