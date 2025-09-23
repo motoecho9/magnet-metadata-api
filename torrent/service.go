@@ -279,9 +279,12 @@ func (ts *TorrentService) getTorrentMetadata(ctx context.Context, magnetURI stri
 
 	// Ensure we clean up the torrent when done
 	defer func() {
-		// Only drop if we added it and it's not needed anymore
 		if t != nil {
-			log.Printf("Dropping torrent from client: %s", infoHashStr)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Torrent already dropped: %s", infoHashStr)
+				}
+			}()
 			t.Drop()
 		}
 	}()
