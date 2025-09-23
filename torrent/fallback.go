@@ -69,7 +69,7 @@ var (
 
 	// Rate limiter for iTorrents requests
 	// Conservative: 10 requests per second with burst of 20
-	iTorrentsRateLimiter = NewRateLimiter(10.0, 20)
+	iTorrentsRateLimiter = NewRateLimiter(2.0, 4)
 )
 
 var iTorrentsClient = &http.Client{
@@ -88,7 +88,7 @@ var iTorrentsClient = &http.Client{
 
 func (ts *TorrentService) getMetadataFromITorrents(infoHash string) (*model.TorrentMetadata, error) {
 	// Rate limit the request
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
 	if err := iTorrentsRateLimiter.Wait(ctx); err != nil {
@@ -135,7 +135,7 @@ func fetchTorrentHeader(url string) ([]byte, error) {
 
 	for currentSize <= maxHeaderSize {
 		// Apply rate limiting for each chunk request
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := iTorrentsRateLimiter.Wait(ctx); err != nil {
 			cancel()
 			return nil, fmt.Errorf("rate limiter timeout for chunk request: %w", err)
