@@ -532,9 +532,10 @@ func (ts *TorrentService) handleHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]interface{}{
 		"status": "ok",
 		"stats": map[string]interface{}{
-			"active_torrents": len(ts.client.Torrents()) + int(ts.fileCount),
-			"active_locks":    activeLocks,
-			"dlq_entries":     len(dlqEntries),
+			"active_torrents":           len(ts.client.Torrents()) + int(ts.fileCount),
+			"active_locks":              activeLocks,
+			"dlq_entries":               len(dlqEntries),
+			"active_itorrents_requests": ts.activeITorrentsRequests,
 		},
 	}
 
@@ -760,14 +761,10 @@ func (ts *TorrentService) removeTorrentFromDLQ(infoHash string) {
 	}
 }
 
-// processDLQ smart background service to retry failed torrents
+// processDLQ sequential background service to retry failed torrents
 func (ts *TorrentService) processDLQ() {
-	ticker := time.NewTicker(30 * time.Second) // Check more frequently
-	defer ticker.Stop()
-
-	log.Printf("Smart DLQ processor started")
+	log.Printf("DLQ processor started")
 	isPaused := false
-	processingDelay := 2 * time.Second // Delay between processing items
 
 	for {
 		select {
@@ -783,17 +780,25 @@ func (ts *TorrentService) processDLQ() {
 				isPaused = false
 			}
 
-		case <-ticker.C:
-			if !isPaused && atomic.LoadInt32(&ts.activeITorrentsRequests) == 0 {
-				if ts.processNextDLQEntry() {
-					// If we processed something, add a small delay before next item
-					time.Sleep(processingDelay)
-				}
-			}
-
 		case <-ts.ctx.Done():
 			log.Printf("DLQ processor stopped")
 			return
+
+		default:
+			if !isPaused {
+				// Process one item
+				ts.processNextDLQEntry()
+
+				// Wait 1 second before next item
+				select {
+				case <-time.After(1 * time.Second):
+				case <-ts.ctx.Done():
+					return
+				}
+			} else {
+				// When paused, check for resume events more frequently
+				time.Sleep(1000 * time.Millisecond)
+			}
 		}
 	}
 }
