@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/dht/v2"
@@ -41,6 +42,11 @@ type TorrentService struct {
 	// Dead Letter Queue for failed torrents
 	dlqFile string
 	dlqMux  sync.RWMutex
+
+	// Activity tracking for smart DLQ processing
+	activeITorrentsRequests int32 // atomic counter
+	dlqPaused               chan bool
+	dlqResume               chan bool
 }
 
 func NewTorrentService(config *config.Config) (*TorrentService, error) {
@@ -129,14 +135,17 @@ func NewTorrentService(config *config.Config) (*TorrentService, error) {
 	}
 
 	service := &TorrentService{
-		config:      config,
-		client:      client,
-		redisClient: redisClient,
-		ctx:         ctx,
-		fileCount:   fileCount,
-		hashLocks:   make(map[string]*sync.Mutex),
-		lockMapMux:  sync.RWMutex{},
-		dlqFile:     filepath.Join(config.CacheDir, "dlq.json"),
+		config:                  config,
+		client:                  client,
+		redisClient:             redisClient,
+		ctx:                     ctx,
+		fileCount:               fileCount,
+		hashLocks:               make(map[string]*sync.Mutex),
+		lockMapMux:              sync.RWMutex{},
+		dlqFile:                 filepath.Join(config.CacheDir, "dlq.json"),
+		activeITorrentsRequests: 0,
+		dlqPaused:               make(chan bool, 1),
+		dlqResume:               make(chan bool, 1),
 	}
 
 	// Start background DLQ processor
@@ -442,7 +451,7 @@ func (ts *TorrentService) handleGetMetadata(w http.ResponseWriter, r *http.Reque
 	}()
 
 	go func() {
-		metadata, err := ts.getMetadataFromITorrents(infoHashStr)
+		metadata, err := ts.getMetadataFromITorrentsWithTracking(infoHashStr)
 		select {
 		case resultCh <- result{metadata, err}:
 		case <-ctx.Done():
@@ -556,18 +565,40 @@ func (ts *TorrentService) handleGetDLQ(w http.ResponseWriter, r *http.Request) {
 }
 
 func (ts *TorrentService) handleForceDLQ(w http.ResponseWriter, r *http.Request) {
-	processed := ts.forceDLQProcess()
+	// Create a context that cancels when the request is cancelled
+	ctx := r.Context()
 
+	// Set up streaming response
 	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":   "Force DLQ processing completed",
-		"processed": processed,
-	})
-	if err != nil {
-		log.Printf("Error encoding force DLQ response: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Start streaming response
+	enc := json.NewEncoder(w)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
+
+	// Send initial response
+	enc.Encode(map[string]interface{}{
+		"message": "Force DLQ processing started",
+		"status":  "processing",
+	})
+	flusher.Flush()
+
+	processed := ts.forceDLQProcessWithContext(ctx, func(update map[string]interface{}) {
+		enc.Encode(update)
+		flusher.Flush()
+	})
+
+	// Send final response
+	enc.Encode(map[string]interface{}{
+		"message":   "Force DLQ processing completed",
+		"processed": processed,
+		"status":    "completed",
+	})
 }
 
 func (ts *TorrentService) writeError(w http.ResponseWriter, status int, error, message string) {
@@ -621,6 +652,28 @@ func (ts *TorrentService) SetupRoutes() *mux.Router {
 	})
 
 	return r
+}
+
+// getMetadataFromITorrentsWithTracking wraps the fallback method with activity tracking
+func (ts *TorrentService) getMetadataFromITorrentsWithTracking(infoHash string) (*model.TorrentMetadata, error) {
+	// Increment counter and signal DLQ to pause
+	atomic.AddInt32(&ts.activeITorrentsRequests, 1)
+	select {
+	case ts.dlqPaused <- true:
+	default: // Channel might be full, that's ok
+	}
+
+	defer func() {
+		// Decrement counter and signal DLQ to resume if no more active requests
+		if atomic.AddInt32(&ts.activeITorrentsRequests, -1) == 0 {
+			select {
+			case ts.dlqResume <- true:
+			default: // Channel might be full, that's ok
+			}
+		}
+	}()
+
+	return ts.getMetadataFromITorrents(infoHash)
 }
 
 // addToDLQ adds a failed torrent to the dead letter queue
@@ -707,17 +760,37 @@ func (ts *TorrentService) removeTorrentFromDLQ(infoHash string) {
 	}
 }
 
-// processDLQ background service to retry failed torrents
+// processDLQ smart background service to retry failed torrents
 func (ts *TorrentService) processDLQ() {
-	ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+	ticker := time.NewTicker(30 * time.Second) // Check more frequently
 	defer ticker.Stop()
 
-	log.Printf("DLQ processor started")
+	log.Printf("Smart DLQ processor started")
+	isPaused := false
+	processingDelay := 2 * time.Second // Delay between processing items
 
 	for {
 		select {
+		case <-ts.dlqPaused:
+			if !isPaused {
+				log.Printf("DLQ processor paused (iTorrents activity detected)")
+				isPaused = true
+			}
+
+		case <-ts.dlqResume:
+			if isPaused {
+				log.Printf("DLQ processor resumed (iTorrents activity stopped)")
+				isPaused = false
+			}
+
 		case <-ticker.C:
-			ts.processNextDLQEntry()
+			if !isPaused && atomic.LoadInt32(&ts.activeITorrentsRequests) == 0 {
+				if ts.processNextDLQEntry() {
+					// If we processed something, add a small delay before next item
+					time.Sleep(processingDelay)
+				}
+			}
+
 		case <-ts.ctx.Done():
 			log.Printf("DLQ processor stopped")
 			return
@@ -725,14 +798,14 @@ func (ts *TorrentService) processDLQ() {
 	}
 }
 
-// processNextDLQEntry processes one entry from the DLQ
-func (ts *TorrentService) processNextDLQEntry() {
+// processNextDLQEntry processes one entry from the DLQ, returns true if processed something
+func (ts *TorrentService) processNextDLQEntry() bool {
 	ts.dlqMux.RLock()
 	entries := ts.loadDLQ()
 	ts.dlqMux.RUnlock()
 
 	if len(entries) == 0 {
-		return
+		return false
 	}
 
 	// Find entry that's eligible for retry (not attempted recently and hasn't failed too many times)
@@ -756,7 +829,7 @@ func (ts *TorrentService) processNextDLQEntry() {
 	}
 
 	if selectedEntry == nil {
-		return
+		return false
 	}
 
 	log.Printf("Retrying DLQ entry: %s (attempt %d)", selectedEntry.InfoHash, selectedEntry.FailCount+1)
@@ -767,7 +840,7 @@ func (ts *TorrentService) processNextDLQEntry() {
 		// Update failure
 		ts.addToDLQ(selectedEntry.InfoHash, selectedEntry.MagnetURI, err.Error())
 		log.Printf("DLQ retry failed for %s: %v", selectedEntry.InfoHash, err)
-		return
+		return true
 	}
 
 	// Success! Cache the metadata and remove from DLQ
@@ -777,34 +850,71 @@ func (ts *TorrentService) processNextDLQEntry() {
 
 	ts.removeTorrentFromDLQ(selectedEntry.InfoHash)
 	log.Printf("DLQ retry succeeded for %s", selectedEntry.InfoHash)
+	return true
 }
 
-// forceDLQProcess processes multiple DLQ entries ignoring LastAttempt timing
+// forceDLQProcess processes multiple DLQ entries ignoring LastAttempt timing (legacy method)
 func (ts *TorrentService) forceDLQProcess() int {
+	return ts.forceDLQProcessWithContext(context.Background(), nil)
+}
+
+// forceDLQProcessWithContext processes DLQ entries with context cancellation and progress updates
+func (ts *TorrentService) forceDLQProcessWithContext(ctx context.Context, progressCallback func(map[string]interface{})) int {
 	ts.dlqMux.RLock()
 	entries := ts.loadDLQ()
 	ts.dlqMux.RUnlock()
 
 	if len(entries) == 0 {
+		if progressCallback != nil {
+			progressCallback(map[string]interface{}{
+				"message":   "No entries in DLQ",
+				"processed": 0,
+			})
+		}
 		return 0
 	}
 
 	processed := 0
-	maxToProcess := 5 // Limit to avoid overload
+	processingDelay := 3 * time.Second // Slower processing for force mode
 
 	log.Printf("Force processing DLQ entries, found %d entries", len(entries))
 
-	for _, entry := range entries {
-		if processed >= maxToProcess {
-			break
+	if progressCallback != nil {
+		progressCallback(map[string]interface{}{
+			"message":       fmt.Sprintf("Found %d entries to process", len(entries)),
+			"total_entries": len(entries),
+		})
+	}
+
+	for i, entry := range entries {
+		select {
+		case <-ctx.Done():
+			log.Printf("Force DLQ processing cancelled after %d entries", processed)
+			if progressCallback != nil {
+				progressCallback(map[string]interface{}{
+					"message":   "Processing cancelled by client",
+					"processed": processed,
+					"cancelled": true,
+				})
+			}
+			return processed
+		default:
 		}
 
 		// Skip if failed too many times
-		if entry.FailCount >= 15 { // Higher limit for forced processing
+		if entry.FailCount >= 15 {
 			continue
 		}
 
 		log.Printf("Force retrying DLQ entry: %s (attempt %d)", entry.InfoHash, entry.FailCount+1)
+
+		if progressCallback != nil {
+			progressCallback(map[string]interface{}{
+				"message":      fmt.Sprintf("Processing entry %d/%d: %s", i+1, len(entries), entry.InfoHash),
+				"current_hash": entry.InfoHash,
+				"attempt":      entry.FailCount + 1,
+			})
+		}
 
 		// Try to get metadata using fallback only
 		metadata, err := ts.getMetadataFromITorrents(entry.InfoHash)
@@ -812,6 +922,13 @@ func (ts *TorrentService) forceDLQProcess() int {
 			// Update failure
 			ts.addToDLQ(entry.InfoHash, entry.MagnetURI, err.Error())
 			log.Printf("Force DLQ retry failed for %s: %v", entry.InfoHash, err)
+			if progressCallback != nil {
+				progressCallback(map[string]interface{}{
+					"message": fmt.Sprintf("Failed to process %s: %v", entry.InfoHash, err),
+					"hash":    entry.InfoHash,
+					"status":  "failed",
+				})
+			}
 			continue
 		}
 
@@ -823,6 +940,22 @@ func (ts *TorrentService) forceDLQProcess() int {
 		ts.removeTorrentFromDLQ(entry.InfoHash)
 		log.Printf("Force DLQ retry succeeded for %s", entry.InfoHash)
 		processed++
+
+		if progressCallback != nil {
+			progressCallback(map[string]interface{}{
+				"message":   fmt.Sprintf("Successfully processed %s", entry.InfoHash),
+				"hash":      entry.InfoHash,
+				"status":    "success",
+				"processed": processed,
+			})
+		}
+
+		// Add delay between processing (unless cancelled)
+		select {
+		case <-ctx.Done():
+			return processed
+		case <-time.After(processingDelay):
+		}
 	}
 
 	log.Printf("Force DLQ processing completed, processed %d entries", processed)
