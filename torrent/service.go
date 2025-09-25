@@ -555,6 +555,21 @@ func (ts *TorrentService) handleGetDLQ(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (ts *TorrentService) handleForceDLQ(w http.ResponseWriter, r *http.Request) {
+	processed := ts.forceDLQProcess()
+
+	w.Header().Set("Content-Type", "application/json")
+	err := json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":   "Force DLQ processing completed",
+		"processed": processed,
+	})
+	if err != nil {
+		log.Printf("Error encoding force DLQ response: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
 func (ts *TorrentService) writeError(w http.ResponseWriter, status int, error, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -577,6 +592,7 @@ func (ts *TorrentService) SetupRoutes() *mux.Router {
 	api.HandleFunc("/metadata", ts.handleGetMetadata).Methods("POST")
 	api.HandleFunc("/health", ts.handleHealth).Methods("GET")
 	api.HandleFunc("/dlq", ts.handleGetDLQ).Methods("GET")
+	api.HandleFunc("/dlq/process", ts.handleForceDLQ).Methods("POST")
 
 	// Download route (if enabled)
 	if ts.config.EnableDownloads {
@@ -761,4 +777,54 @@ func (ts *TorrentService) processNextDLQEntry() {
 
 	ts.removeTorrentFromDLQ(selectedEntry.InfoHash)
 	log.Printf("DLQ retry succeeded for %s", selectedEntry.InfoHash)
+}
+
+// forceDLQProcess processes multiple DLQ entries ignoring LastAttempt timing
+func (ts *TorrentService) forceDLQProcess() int {
+	ts.dlqMux.RLock()
+	entries := ts.loadDLQ()
+	ts.dlqMux.RUnlock()
+
+	if len(entries) == 0 {
+		return 0
+	}
+
+	processed := 0
+	maxToProcess := 5 // Limit to avoid overload
+
+	log.Printf("Force processing DLQ entries, found %d entries", len(entries))
+
+	for _, entry := range entries {
+		if processed >= maxToProcess {
+			break
+		}
+
+		// Skip if failed too many times
+		if entry.FailCount >= 15 { // Higher limit for forced processing
+			continue
+		}
+
+		log.Printf("Force retrying DLQ entry: %s (attempt %d)", entry.InfoHash, entry.FailCount+1)
+
+		// Try to get metadata using fallback only
+		metadata, err := ts.getMetadataFromITorrents(entry.InfoHash)
+		if err != nil {
+			// Update failure
+			ts.addToDLQ(entry.InfoHash, entry.MagnetURI, err.Error())
+			log.Printf("Force DLQ retry failed for %s: %v", entry.InfoHash, err)
+			continue
+		}
+
+		// Success! Cache the metadata and remove from DLQ
+		if err := ts.cacheMetadata(metadata); err != nil {
+			log.Printf("Failed to cache force DLQ success for %s: %v", entry.InfoHash, err)
+		}
+
+		ts.removeTorrentFromDLQ(entry.InfoHash)
+		log.Printf("Force DLQ retry succeeded for %s", entry.InfoHash)
+		processed++
+	}
+
+	log.Printf("Force DLQ processing completed, processed %d entries", processed)
+	return processed
 }
