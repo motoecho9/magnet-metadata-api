@@ -14,6 +14,7 @@ type Config struct {
 	DHTPeers        []string
 	ClientPort      int
 	SeedingEnabled  bool
+	BitmagnetURL    string
 }
 
 func LoadConfig() *Config {
@@ -25,6 +26,7 @@ func LoadConfig() *Config {
 		DownloadBaseURL: getEnv("DOWNLOAD_BASE_URL", "http://localhost:8080"),
 		ClientPort:      getEnvInt("CLIENT_PORT", 42069),
 		SeedingEnabled:  getEnv("SEEDING_ENABLED", "true") == "true",
+		BitmagnetURL:    getEnv("BITMAGNET_URL", ""),
 	}
 
 	// Default DHT bootstrap nodes

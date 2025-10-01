@@ -9,6 +9,15 @@ import (
 )
 
 func main() {
+	// Add global panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Application panic recovered: %v", r)
+			// Log the panic and exit gracefully
+			log.Fatalf("Application crashed due to panic: %v", r)
+		}
+	}()
+
 	config := config.LoadConfig()
 
 	log.Printf("Starting Torrent Metadata API Service")

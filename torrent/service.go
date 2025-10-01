@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -33,7 +34,7 @@ type TorrentService struct {
 	client      *torrent.Client
 	redisClient *redis.Client
 	ctx         context.Context
-	fileCount   int64
+	fileCount   *int64
 
 	// Lock mechanism for preventing concurrent requests for same hash
 	hashLocks  map[string]*sync.Mutex
@@ -104,11 +105,13 @@ func NewTorrentService(config *config.Config) (*TorrentService, error) {
 		return nil, fmt.Errorf("failed to create torrent client: %w", err)
 	}
 
-	fileCount, err := util.CountDir(config.CacheDir)
+	var fileCount *int64
+	fc, err := util.CountDir(config.CacheDir)
 	if err != nil {
 		fmt.Printf("Warning: Failed to count cached files: %v. Using 0 as initial count.", err)
-		fileCount = 0
+		fc = 0
 	}
+	fileCount = &fc
 
 	// update fileCount every 10 minutes
 	go func() {
@@ -119,8 +122,8 @@ func NewTorrentService(config *config.Config) (*TorrentService, error) {
 			if err != nil {
 				log.Printf("Warning: Failed to update cached file count: %v", err)
 			} else {
-				fileCount = count
-				log.Printf("Updated cached file count: %d", fileCount)
+				fileCount = &count
+				log.Printf("Updated cached file count: %d", *fileCount)
 			}
 		}
 	}()
@@ -440,8 +443,9 @@ func (ts *TorrentService) handleGetMetadata(w http.ResponseWriter, r *http.Reque
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	resultCh := make(chan result, 2)
+	resultCh := make(chan result, 3)
 
+	// Try DHT-based metadata retrieval
 	go func() {
 		metadata, err := ts.getTorrentMetadata(ctx, req.MagnetURI)
 		select {
@@ -450,6 +454,16 @@ func (ts *TorrentService) handleGetMetadata(w http.ResponseWriter, r *http.Reque
 		}
 	}()
 
+	// Try Bitmagnet provider
+	go func() {
+		metadata, err := ts.getMetadataFromBitmagnet(infoHashStr)
+		select {
+		case resultCh <- result{metadata, err}:
+		case <-ctx.Done():
+		}
+	}()
+
+	// Try iTorrents as fallback
 	go func() {
 		metadata, err := ts.getMetadataFromITorrentsWithTracking(infoHashStr)
 		select {
@@ -459,7 +473,7 @@ func (ts *TorrentService) handleGetMetadata(w http.ResponseWriter, r *http.Reque
 	}()
 
 	var lastErr error
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		select {
 		case res := <-resultCh:
 			if res.err == nil {
@@ -532,7 +546,7 @@ func (ts *TorrentService) handleHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]interface{}{
 		"status": "ok",
 		"stats": map[string]interface{}{
-			"active_torrents":           len(ts.client.Torrents()) + int(ts.fileCount),
+			"active_torrents":           len(ts.client.Torrents()) + int(*ts.fileCount),
 			"active_locks":              activeLocks,
 			"dlq_entries":               len(dlqEntries),
 			"active_itorrents_requests": ts.activeITorrentsRequests,
@@ -625,6 +639,10 @@ func (ts *TorrentService) SetupRoutes() *mux.Router {
 	api.HandleFunc("/health", ts.handleHealth).Methods("GET")
 	api.HandleFunc("/dlq", ts.handleGetDLQ).Methods("GET")
 	api.HandleFunc("/dlq/process", ts.handleForceDLQ).Methods("POST")
+
+	// Test endpoints
+	api.HandleFunc("/test/bitmagnet", ts.handleTestBitmagnet).Methods("POST")
+	api.HandleFunc("/test/cache/{hash}", ts.handleTestCache).Methods("GET")
 
 	// Download route (if enabled)
 	if ts.config.EnableDownloads {
@@ -764,6 +782,7 @@ func (ts *TorrentService) removeTorrentFromDLQ(infoHash string) {
 // processDLQ sequential background service to retry failed torrents
 func (ts *TorrentService) processDLQ() {
 	log.Printf("DLQ processor started")
+	defer log.Printf("DLQ processor stopped PERMANENTLY")
 	isPaused := false
 
 	for {
@@ -817,6 +836,14 @@ func (ts *TorrentService) processNextDLQEntry() bool {
 	now := time.Now()
 	var selectedEntry *model.DLQEntry
 
+	// Shuffle entries to avoid always picking the same one
+	randIndices := rand.Perm(len(entries))
+	shuffledEntries := make([]model.DLQEntry, len(entries))
+	for i, idx := range randIndices {
+		shuffledEntries[i] = entries[idx]
+	}
+	entries = shuffledEntries
+
 	for i, entry := range entries {
 		// Skip if attempted recently (wait longer based on fail count)
 		backoffMinutes := math.Min(float64(entry.FailCount*30), 240) // Max 4 hours backoff
@@ -824,8 +851,8 @@ func (ts *TorrentService) processNextDLQEntry() bool {
 			continue
 		}
 
-		// Skip if failed too many times
-		if entry.FailCount >= 10 {
+		// skip if shouldAttempt is false (for future use)
+		if shouldAttempt(entry) == false {
 			continue
 		}
 
@@ -839,8 +866,18 @@ func (ts *TorrentService) processNextDLQEntry() bool {
 
 	log.Printf("Retrying DLQ entry: %s (attempt %d)", selectedEntry.InfoHash, selectedEntry.FailCount+1)
 
-	// Try to get metadata using fallback only
-	metadata, err := ts.getMetadataFromITorrents(selectedEntry.InfoHash)
+	// Try Bitmagnet first, then fallback to iTorrents
+	var metadata *model.TorrentMetadata
+	var err error
+
+	// Try Bitmagnet first
+	metadata, err = ts.getMetadataFromBitmagnet(selectedEntry.InfoHash)
+	if err != nil {
+		log.Printf("DLQ Bitmagnet retry failed for %s: %v", selectedEntry.InfoHash, err)
+		// Try iTorrents as fallback
+		metadata, err = ts.getMetadataFromITorrents(selectedEntry.InfoHash)
+	}
+
 	if err != nil {
 		// Update failure
 		ts.addToDLQ(selectedEntry.InfoHash, selectedEntry.MagnetURI, err.Error())
@@ -855,6 +892,24 @@ func (ts *TorrentService) processNextDLQEntry() bool {
 
 	ts.removeTorrentFromDLQ(selectedEntry.InfoHash)
 	log.Printf("DLQ retry succeeded for %s", selectedEntry.InfoHash)
+	return true
+}
+
+// shouldAttempt determines if a DLQ entry should be attempted based on fail count and timing
+// this is used only on the automatic DLQ processor, not the force method
+func shouldAttempt(entry model.DLQEntry) bool {
+	// attemts limit
+	if entry.FailCount >= 100 {
+		return false
+	}
+
+	// add a wait that is baseMinutes ** failCount, capped at 1 day, since last attempt
+	baseMinutes := 2.0
+	waitMinutes := math.Min(math.Pow(baseMinutes*float64(entry.FailCount), 2), 1440) // max 1 day
+	if time.Since(entry.LastAttempt) < time.Duration(waitMinutes)*time.Minute {
+		return false
+	}
+
 	return true
 }
 
@@ -891,6 +946,14 @@ func (ts *TorrentService) forceDLQProcessWithContext(ctx context.Context, progre
 		})
 	}
 
+	// shuffle entries to avoid always processing in same order
+	randIndices := rand.Perm(len(entries))
+	shuffledEntries := make([]model.DLQEntry, len(entries))
+	for i, idx := range randIndices {
+		shuffledEntries[i] = entries[idx]
+	}
+	entries = shuffledEntries
+
 	for i, entry := range entries {
 		select {
 		case <-ctx.Done():
@@ -906,11 +969,6 @@ func (ts *TorrentService) forceDLQProcessWithContext(ctx context.Context, progre
 		default:
 		}
 
-		// Skip if failed too many times
-		if entry.FailCount >= 15 {
-			continue
-		}
-
 		log.Printf("Force retrying DLQ entry: %s (attempt %d)", entry.InfoHash, entry.FailCount+1)
 
 		if progressCallback != nil {
@@ -921,8 +979,18 @@ func (ts *TorrentService) forceDLQProcessWithContext(ctx context.Context, progre
 			})
 		}
 
-		// Try to get metadata using fallback only
-		metadata, err := ts.getMetadataFromITorrents(entry.InfoHash)
+		// Try Bitmagnet first, then fallback to iTorrents
+		var metadata *model.TorrentMetadata
+		var err error
+
+		// Try Bitmagnet first
+		metadata, err = ts.getMetadataFromBitmagnet(entry.InfoHash)
+		if err != nil {
+			log.Printf("Force DLQ Bitmagnet retry failed for %s: %v", entry.InfoHash, err)
+			// Try iTorrents as fallback
+			metadata, err = ts.getMetadataFromITorrents(entry.InfoHash)
+		}
+
 		if err != nil {
 			// Update failure
 			ts.addToDLQ(entry.InfoHash, entry.MagnetURI, err.Error())
@@ -965,4 +1033,84 @@ func (ts *TorrentService) forceDLQProcessWithContext(ctx context.Context, progre
 
 	log.Printf("Force DLQ processing completed, processed %d entries", processed)
 	return processed
+}
+
+// handleTestBitmagnet tests Bitmagnet provider directly
+func (ts *TorrentService) handleTestBitmagnet(w http.ResponseWriter, r *http.Request) {
+	var req model.MagnetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		ts.writeError(w, http.StatusBadRequest, "Invalid JSON", err.Error())
+		return
+	}
+
+	if req.MagnetURI == "" {
+		ts.writeError(w, http.StatusBadRequest, "Missing magnet URI", "magnet_uri field is required")
+		return
+	}
+
+	// Parse magnet URI to get info hash
+	infoHash, err := ts.parseMagnetURI(req.MagnetURI)
+	if err != nil {
+		ts.writeError(w, http.StatusBadRequest, "Invalid magnet URI", err.Error())
+		return
+	}
+
+	infoHashStr := infoHash.String()
+
+	// Test Bitmagnet provider directly
+	metadata, err := ts.getMetadataFromBitmagnet(infoHashStr)
+	if err != nil {
+		ts.writeError(w, http.StatusInternalServerError, "Bitmagnet test failed", err.Error())
+		return
+	}
+
+	// Return the metadata with additional test info
+	response := map[string]interface{}{
+		"test_type": "bitmagnet",
+		"info_hash": infoHashStr,
+		"success":   true,
+		"metadata":  metadata,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleTestCache tests cache retrieval directly
+func (ts *TorrentService) handleTestCache(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	infoHash := vars["hash"]
+
+	if len(infoHash) != 40 {
+		ts.writeError(w, http.StatusBadRequest, "Invalid hash", "Hash must be 40 characters long")
+		return
+	}
+
+	// Convert to uppercase for consistency
+	infoHashUpper := strings.ToUpper(infoHash)
+
+	// Test cache retrieval
+	metadata, err := ts.getCachedMetadata(infoHashUpper)
+	if err != nil {
+		ts.writeError(w, http.StatusInternalServerError, "Cache test failed", err.Error())
+		return
+	}
+
+	response := map[string]interface{}{
+		"test_type": "cache",
+		"info_hash": infoHashUpper,
+	}
+
+	if metadata != nil {
+		response["success"] = true
+		response["cache_hit"] = true
+		response["metadata"] = metadata
+	} else {
+		response["success"] = true
+		response["cache_hit"] = false
+		response["message"] = "No cached data found for this hash"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
