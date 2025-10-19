@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -44,6 +45,7 @@ type TorrentFileInfo struct {
 // Custom decoder that stops when it encounters the pieces field
 type PartialTorrentInfo struct {
 	Name        string            `bencode:"name"`
+	NameUTF8    string            `bencode:"name.utf-8"`
 	Length      int64             `bencode:"length"`
 	Files       []TorrentFileInfo `bencode:"files"`
 	PieceLength int64             `bencode:"piece length"`
@@ -98,18 +100,47 @@ func (ts *TorrentService) getMetadataFromITorrents(infoHash string) (*model.Torr
 	// Convert info hash to uppercase hex format
 	infoHashHex := strings.ToUpper(infoHash)
 
+	lowercaseRetry := 0
 	// Construct iTorrents URL
 	torrentURL := fmt.Sprintf("https://itorrents.org/torrent/%s.torrent", infoHashHex)
 
 	// Fetch torrent file header
 	torrentData, err := fetchTorrentHeader(torrentURL)
 	if err != nil {
-		return nil, fmt.Errorf("[fallback] failed to fetch torrent file %s: %w", infoHash, err)
+		// Retry with lowercase info hash if not already tried
+		if lowercaseRetry == 0 {
+			lowercaseRetry++
+			infoHashHex = strings.ToLower(infoHash)
+			torrentURL = fmt.Sprintf("https://itorrents.org/torrent/%s.torrent", infoHashHex)
+			torrentData, err = fetchTorrentHeader(torrentURL)
+			if err == nil {
+				log.Printf("[fallback] successfully fetched torrent with lowercase info hash: %s", infoHashHex)
+			}
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("[fallback] failed to fetch torrent file %s: %w", infoHash, err)
+		}
 	}
 
 	// Parse torrent file
 	metadata, err := parsePartialTorrentFile(torrentData, infoHashHex)
 	if err != nil {
+		// here, it the error message contains "Invalid input", save the torrent file for analysis on a folder inside the CacheDir
+		if strings.Contains(err.Error(), "Invalid input") {
+			errorDir := filepath.Join(ts.config.CacheDir, "errors")
+			if err := os.MkdirAll(errorDir, 0755); err != nil {
+				log.Printf("[fallback] failed to create error directory: %v", err)
+			} else {
+				errorFilePath := filepath.Join(errorDir, fmt.Sprintf("%s.torrent", infoHashHex))
+				if writeErr := os.WriteFile(errorFilePath, torrentData, 0644); writeErr != nil {
+					log.Printf("[fallback] failed to write error torrent file: %v", writeErr)
+				} else {
+					log.Printf("[fallback] saved invalid torrent file for analysis: %s", errorFilePath)
+				}
+			}
+		}
+
 		return nil, fmt.Errorf("[fallback] failed to parse torrent file: %w", err)
 	}
 
@@ -149,6 +180,13 @@ func fetchTorrentHeader(url string) ([]byte, error) {
 		}
 
 		allData.Write(chunk)
+
+		// stop if DOCTYPE is found (indicates HTML error page)
+		if bytes.Contains(allData.Bytes(), []byte("<!DOCTYPE html")) {
+			// log the url that caused the HTML response
+			log.Printf("[fallback] received HTML error page when fetching torrent from %s", url)
+			return nil, fmt.Errorf("received HTML error page instead of torrent file")
+		}
 
 		// Try to parse what we have so far
 		if complete, safeData := getCompleteHeader(allData.Bytes()); complete {
@@ -238,14 +276,19 @@ func parsePartialTorrentFile(data []byte, infoHash string) (*model.TorrentMetada
 	var torrent PartialTorrentFile
 
 	err := bencode.DecodeBytes(data, &torrent)
-	if err != nil && torrent.Info.Name == "" {
+	if err != nil && (torrent.Info.Name == "" && torrent.Info.NameUTF8 == "") {
 		// If partial parsing fails, try to extract what we can manually
 		return parseManuallyFromBytes(data, infoHash)
 	}
 
+	name := torrent.Info.Name
+	if torrent.Info.NameUTF8 != "" {
+		name = torrent.Info.NameUTF8
+	}
+
 	metadata := &model.TorrentMetadata{
 		InfoHash: infoHash,
-		Name:     torrent.Info.Name,
+		Name:     name,
 		Comment:  torrent.Comment,
 	}
 

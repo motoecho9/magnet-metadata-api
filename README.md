@@ -116,6 +116,7 @@ All configuration is done via environment variables:
 | `DOWNLOAD_BASE_URL` | `http://localhost:8080` | Base URL for download links |
 | `CLIENT_PORT` | `42069` | BitTorrent client port |
 | `SEEDING_ENABLED` | `true` | Participate in seeding torrents |
+| `BITMAGNET_URL` | _(empty)_ | Bitmagnet GraphQL API URL (e.g., `http://localhost:3333`) |
 
 ### Example Configuration
 
@@ -126,6 +127,7 @@ export CACHE_DIR=/var/cache/torrents
 export ENABLE_DOWNLOADS=true
 export DOWNLOAD_BASE_URL=https://my-domain.com
 export SEEDING_ENABLED=true
+export BITMAGNET_URL=http://bitmagnet-server:3333
 ```
 
 ## Caching Strategy
