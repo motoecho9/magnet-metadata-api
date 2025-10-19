@@ -32,8 +32,8 @@ type GraphQLError struct {
 }
 
 type BitmagnetData struct {
-	TorrentInfo  TorrentContentSearch `json:"torrentInfo"`
-	TorrentFiles TorrentFilesResult   `json:"torrentFiles"`
+	TorrentContent TorrentContentSearch `json:"torrentContent"`
+	Torrent        TorrentResult        `json:"torrent"`
 }
 
 type TorrentContentSearch struct {
@@ -45,9 +45,10 @@ type TorrentSearchResult struct {
 }
 
 type TorrentSearchItem struct {
-	InfoHash string           `json:"infoHash"`
-	Title    string           `json:"title"`
-	Torrent  BitmagnetTorrent `json:"torrent"`
+	InfoHash    string           `json:"infoHash"`
+	ContentType string           `json:"contentType"`
+	Title       string           `json:"title"`
+	Torrent     BitmagnetTorrent `json:"torrent"`
 }
 
 type BitmagnetTorrent struct {
@@ -62,21 +63,22 @@ type BitmagnetTorrent struct {
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
-type TorrentFilesResult struct {
+type TorrentResult struct {
 	Files TorrentFiles `json:"files"`
 }
 
 type TorrentFiles struct {
-	TotalCount int                 `json:"totalCount"`
-	Items      []BitmagnetFileInfo `json:"items"`
+	Items []BitmagnetFileInfo `json:"items"`
 }
 
 type BitmagnetFileInfo struct {
-	Index     int    `json:"index"`
-	Path      string `json:"path"`
-	Size      int64  `json:"size"`
-	Extension string `json:"extension"`
-	FileType  string `json:"fileType"`
+	InfoHash  string    `json:"infoHash"`
+	Index     int       `json:"index"`
+	Path      string    `json:"path"`
+	Size      int64     `json:"size"`
+	FileType  string    `json:"fileType"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 var (
@@ -114,16 +116,14 @@ func (ts *TorrentService) getMetadataFromBitmagnet(infoHash string) (*model.Torr
 	// Convert info hash to uppercase for consistency
 	infoHashUpper := strings.ToUpper(infoHash)
 
-	// Prepare GraphQL query and variables
+	// Prepare GraphQL query and variables - optimized query using infoHashes directly
 	query := `
-		query GetTorrentMetadata($infoHashString: String!, $infoHashHash: Hash20!) {
-			torrentInfo: torrentContent {
-				search(input: { 
-					queryString: $infoHashString, 
-					limit: 1 
-				}) {
+		query TorrentMetadataAndFiles($contentInput: TorrentContentSearchQueryInput!, $filesInput: TorrentFilesQueryInput!) {
+			torrentContent {
+				search(input: $contentInput) {
 					items {
 						infoHash
+						contentType
 						title
 						torrent {
 							infoHash
@@ -139,27 +139,31 @@ func (ts *TorrentService) getMetadataFromBitmagnet(infoHash string) (*model.Torr
 					}
 				}
 			}
-			
-			torrentFiles: torrent {
-				files(input: { 
-					infoHashes: [$infoHashHash],
-					limit: 100
-				}) {
-					totalCount
+			torrent {
+				files(input: $filesInput) {
 					items {
+						infoHash
 						index
 						path
 						size
-						extension
 						fileType
+						createdAt
+						updatedAt
 					}
 				}
 			}
 		}`
 
 	variables := map[string]interface{}{
-		"infoHashString": infoHashUpper,
-		"infoHashHash":   infoHashUpper,
+		"contentInput": map[string]interface{}{
+			"infoHashes": []string{infoHashUpper},
+			"limit":      1,
+		},
+		"filesInput": map[string]interface{}{
+			"infoHashes": []string{infoHashUpper},
+			"limit":      10000,
+			"page":       1,
+		},
 	}
 
 	request := BitmagnetGraphQLRequest{
@@ -201,16 +205,20 @@ func (ts *TorrentService) getMetadataFromBitmagnet(infoHash string) (*model.Torr
 
 	// Check for GraphQL errors
 	if len(bitmagnetResp.Errors) > 0 {
-		return nil, fmt.Errorf("[bitmagnet] GraphQL errors: %v", bitmagnetResp.Errors)
+		errorMessages := make([]string, len(bitmagnetResp.Errors))
+		for i, e := range bitmagnetResp.Errors {
+			errorMessages[i] = e.Message
+		}
+		return nil, fmt.Errorf("[bitmagnet] GraphQL errors: %s", strings.Join(errorMessages, ", "))
 	}
 
 	// Check if we found any results
-	if len(bitmagnetResp.Data.TorrentInfo.Search.Items) == 0 {
+	if len(bitmagnetResp.Data.TorrentContent.Search.Items) == 0 {
 		return nil, fmt.Errorf("[bitmagnet] no torrent found for hash: %s", infoHash)
 	}
 
 	// Extract torrent info
-	torrentItem := bitmagnetResp.Data.TorrentInfo.Search.Items[0]
+	torrentItem := bitmagnetResp.Data.TorrentContent.Search.Items[0]
 	torrentInfo := torrentItem.Torrent
 
 	// Build metadata
@@ -232,11 +240,11 @@ func (ts *TorrentService) getMetadataFromBitmagnet(infoHash string) (*model.Torr
 	}
 
 	// Process files if available
-	if len(bitmagnetResp.Data.TorrentFiles.Files.Items) > 0 {
-		files := make([]model.FileInfo, 0, len(bitmagnetResp.Data.TorrentFiles.Files.Items))
+	if len(bitmagnetResp.Data.Torrent.Files.Items) > 0 {
+		files := make([]model.FileInfo, 0, len(bitmagnetResp.Data.Torrent.Files.Items))
 		var offset int64
 
-		for _, file := range bitmagnetResp.Data.TorrentFiles.Files.Items {
+		for _, file := range bitmagnetResp.Data.Torrent.Files.Items {
 			files = append(files, model.FileInfo{
 				Path:   file.Path,
 				Size:   file.Size,
