@@ -40,6 +40,9 @@ COPY --from=builder /app/web ./web
 # Create cache directory
 RUN mkdir -p ./cache && chown torrent:torrent ./cache
 
+# Add curl for health checks
+RUN apk --no-cache add curl
+
 # Switch to non-root user
 USER torrent
 
