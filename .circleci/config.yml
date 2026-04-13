@@ -124,5 +124,7 @@ workflows:
     jobs:
       - build-and-publish:
           filters:
+            tags:
+              only: /^v.*/
             branches:
-              only: master
+              ignore: /.*/
