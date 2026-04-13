@@ -1,0 +1,131 @@
+version: 2.1
+
+jobs:
+  build-and-publish:
+    machine:
+      image: ubuntu-2204:current
+
+    steps:
+      - checkout
+
+      # 0️⃣ 安装必要工具
+      - run:
+          name: 🛠️ 安装工具 (jq, gh)
+          command: |
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+
+            # 安装 GitHub CLI
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+              sudo gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+              sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+
+      # 1️⃣ 设置 buildx（多架构）
+      - run:
+          name: 🛠️ 设置 Buildx
+          command: |
+            docker run --privileged --rm tonistiigi/binfmt --install all
+            docker buildx create --name builder --use
+            docker buildx inspect --bootstrap
+
+      # 2️⃣ 登录 GHCR
+      - run:
+          name: 🔐 登录 GHCR
+          command: |
+            USERNAME=$(echo "${CIRCLE_PROJECT_USERNAME}" | tr '[:upper:]' '[:lower:]')
+            echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${USERNAME}" --password-stdin
+
+      # 3️⃣ 构建并推送镜像
+      - run:
+          name: 🏗️ 构建并推送 Docker 镜像
+          command: |
+            USERNAME=$(echo "${CIRCLE_PROJECT_USERNAME}" | tr '[:upper:]' '[:lower:]')
+            REPONAME=$(echo "${CIRCLE_PROJECT_REPONAME}" | tr '[:upper:]' '[:lower:]')
+
+            IMAGE_NAME="ghcr.io/${USERNAME}/${REPONAME}"
+            echo "export IMAGE_NAME=${IMAGE_NAME}" >> $BASH_ENV
+
+            # tag 优化：优先使用 git tag，否则用 commit short hash
+            TAG=${CIRCLE_TAG:-$(git rev-parse --short HEAD)}
+
+            echo "🚀 构建镜像: ${IMAGE_NAME}:${TAG}"
+
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              -t "${IMAGE_NAME}:${TAG}" \
+              -t "${IMAGE_NAME}:latest" \
+              --cache-from=type=registry,ref=${IMAGE_NAME}:buildcache \
+              --cache-to=type=registry,ref=${IMAGE_NAME}:buildcache,mode=max \
+              --push .
+
+      # 4️⃣ 创建 GitHub Release
+      - run:
+          name: 🚀 创建 GitHub Release
+          command: |
+            source $BASH_ENV
+
+            if [ -n "${CIRCLE_TAG}" ]; then
+              BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+              echo "🎉 **自动构建成功！**" > release_body.txt
+              echo "- 自动构建并发布 Docker 镜像" >> release_body.txt
+              printf '\n' >> release_body.txt
+
+              echo "📦 **镜像仓库**" >> release_body.txt
+              echo "\`${IMAGE_NAME}\`" >> release_body.txt
+              printf '\n' >> release_body.txt
+
+              echo "🏷️ **标签版本**" >> release_body.txt
+              echo "\`${CIRCLE_TAG}\`" >> release_body.txt
+              printf '\n' >> release_body.txt
+
+              echo "🕒 **构建时间**" >> release_body.txt
+              echo "${BUILD_TIME}" >> release_body.txt
+              printf '\n' >> release_body.txt
+
+              echo "🧩 **支持平台**" >> release_body.txt
+              echo "- \`linux/amd64\`" >> release_body.txt
+              echo "- \`linux/arm64\`" >> release_body.txt
+              printf '\n' >> release_body.txt
+
+              echo "🚀 **拉取镜像示例**" >> release_body.txt
+              echo '```bash' >> release_body.txt
+              echo "docker pull ${IMAGE_NAME}:${CIRCLE_TAG}" >> release_body.txt
+              echo '```' >> release_body.txt
+              printf '\n' >> release_body.txt
+
+              echo "🔖 **说明**" >> release_body.txt
+              echo "- 本版本由 CircleCI 自动构建并发布至 GHCR" >> release_body.txt
+              echo "- 推送 Tag 自动触发构建" >> release_body.txt
+              echo "- latest 始终为最新版本" >> release_body.txt
+
+              json=$(jq -n \
+                --arg tag "${CIRCLE_TAG}" \
+                --arg name "Release ${CIRCLE_TAG}" \
+                --arg body "$(cat release_body.txt)" \
+                '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')
+
+              curl -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "${json}" \
+                "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/releases"
+
+              rm release_body.txt
+            fi
+
+workflows:
+  build-and-release:
+    jobs:
+      - build-and-publish:
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+
